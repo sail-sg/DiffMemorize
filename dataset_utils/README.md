@@ -1,5 +1,4 @@
 # On Memorization in Diffusion Models
-Code for the paper [On Memorization in Diffusion Models]().
 
 ## Environments
 
@@ -26,7 +25,7 @@ To download ImageNet, please refer to [ImageNet Object Localization Challenge](h
 
 
 ## Running Experiments
-Firstly, we compare the generated images by the theoretical optimum and state-of-the-art diffusion model (EDM). The experiments are run on a single A100 GPU.
+To generate images in Figure 1 (a) and (b), run following commands on one A100 GPU:
 ```
 bash scripts/run_fig1_ab.sh
 ```
@@ -133,11 +132,3 @@ To reproduce our experiments for conditional EDM with unique labels
 ```
 bash scripts/run_fig5_edm.sh fig5/size50k_edm_unique
 ```
-
-
-## References
-If you find the code useful for your research, please consider citing our paper
-
-
-## Acknowledgements
-Our codes are modified based on the [official implementation of EDM](https://github.com/NVlabs/edm). 
