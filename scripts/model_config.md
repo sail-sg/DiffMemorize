@@ -1,4 +1,4 @@
-# Model configuration $\mathcal{M}$
+# Model configuration
 
 Before conducting the following experiments, we first sample a series of training datasets $\mathcal{D}$ using following commands:
 

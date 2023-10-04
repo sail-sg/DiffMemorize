@@ -1,4 +1,4 @@
-# Data Distribution $P$
+# Data Distribution
 
 ## Data dimension
 We first sample a series of training datasets $\mathcal{D}$ with different dimensions using following commands:

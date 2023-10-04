@@ -1,4 +1,4 @@
-# Training procedure $\mathcal{T}$
+# Training procedure
 
 Before conducting the following experiments, we first sample a series of training datasets $\mathcal{D}$ using following commands:
 
