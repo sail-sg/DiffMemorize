@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 def find_class_folders(class_name):
     assert class_name in ["bird", "cat", "dog"]
-    with open("data_setting/imagenet_hierarch.txt", 'r') as f:
+    with open("data_utils/imagenet_hierarch.txt", 'r') as f:
         lines = f.readlines()
     class_folders = []
     for line in lines:

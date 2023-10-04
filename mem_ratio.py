@@ -13,11 +13,158 @@ import re
 import click
 import tqdm
 import pickle
+import json
+import zipfile
 import numpy as np
 import torch
 import PIL.Image
 import dnnlib
+import scipy.linalg
+from training import dataset
 from torch_utils import distributed as dist
+try:
+    import pyspng
+except ImportError:
+    pyspng = None
+
+#----------------------------------------------------------------------------
+def file_ext(fname):
+    return os.path.splitext(fname)[1].lower()
+
+
+def load_cifar10_zip(zip_path):
+    zip_file = zipfile.ZipFile(zip_path)
+    all_names = set(zip_file.namelist())
+    
+    PIL.Image.init()
+    image_names = sorted(fname for fname in all_names if file_ext(fname) in PIL.Image.EXTENSION)
+
+    # load labels
+    with zip_file.open('dataset.json', 'r') as f:
+        labels = json.load(f)['labels']
+    
+    labels_dict = dict(labels)
+
+    images = []
+    labels = []
+    
+    # load images
+    for name in tqdm.tqdm(image_names):
+        with zip_file.open(name, 'r') as f:
+            if pyspng is not None and file_ext(name) == '.png':
+                image = pyspng.load(f.read())
+            else:
+                image = np.array(PIL.Image.open(f))
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis]  # HW => HWC
+        image = image.transpose(2, 0, 1)     # HWC => CHW
+
+        # append images
+        images.append(image[np.newaxis, :, :, :])
+
+        # append labels
+        label = labels_dict[name]
+        labels.append(label)
+
+    images = np.concatenate(images, axis=0)
+    labels = np.array(labels)
+    labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
+
+    return images, labels
+
+#----------------------------------------------------------------------------
+def calculate_knn_stats(
+    image_path, ref_images, num_expected=None, seed=0, max_batch_size=64,
+    num_workers=3, prefetch_factor=2, device=torch.device('cuda'),
+):
+    # Rank 0 goes first.
+    if dist.get_rank() != 0:
+        torch.distributed.barrier()
+
+    # List images.
+    dist.print0(f'Loading images from "{image_path}"...')
+    dataset_obj = dataset.ImageFolderDataset(path=image_path, max_size=num_expected, random_seed=seed)
+    if num_expected is not None and len(dataset_obj) < num_expected:
+        raise click.ClickException(f'Found {len(dataset_obj)} images, but expected at least {num_expected}')
+    if len(dataset_obj) < 2:
+        raise click.ClickException(f'Found {len(dataset_obj)} images, but need at least 2 to compute statistics')
+
+    # Other ranks follow.
+    if dist.get_rank() == 0:
+        torch.distributed.barrier()
+
+    # Divide images into batches.
+    num_batches = ((len(dataset_obj) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
+    all_batches = torch.arange(len(dataset_obj)).tensor_split(num_batches)
+    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
+    data_loader = torch.utils.data.DataLoader(dataset_obj, batch_sampler=rank_batches, num_workers=num_workers, prefetch_factor=prefetch_factor)
+
+    # Accumulate statistics.
+    dist.print0(f'Calculating statistics for {len(dataset_obj)} images...')
+    knn_distance = torch.zeros([], dtype=torch.float64, device=device)
+    ref_images = ref_images.to(device)
+    N2, C, H, W = ref_images.shape
+    all_distance = []
+    all_index = []
+    for images, _ in tqdm.tqdm(data_loader, unit='batch', disable=(dist.get_rank() != 0)):
+        torch.distributed.barrier()
+        if images.shape[0] == 0:
+            continue
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        images = images.to(torch.float32)
+        images = images.to(device)
+        N1, C, H, W = images.shape
+        distance = torch.cdist(images.reshape(N1, C*H*W), ref_images.reshape(N2, C*H*W)) / np.sqrt(H * W * C)
+        # distance, index = distance.min(dim=1)
+        distance, index = torch.topk(distance, k=2, dim=1, largest=False)  # return the smallest and second smallest
+
+        # gather features from different gpus
+        ys = []
+        for src in range(dist.get_world_size()):
+            y = distance.clone()
+            torch.distributed.broadcast(y, src=src)
+            ys.append(y)
+        distance = torch.cat(ys, dim=0)
+
+
+        ys = []
+        for src in range(dist.get_world_size()):
+            y = index.clone()
+            torch.distributed.broadcast(y, src=src)
+            ys.append(y)
+        index = torch.cat(ys, dim=0)
+
+        all_distance.append(distance.cpu().numpy())
+        all_index.append(index.cpu().numpy())
+
+    # Calculate grand totals.
+    all_distance = np.concatenate(all_distance, axis=0)
+    all_index = np.concatenate(all_index, axis=0)
+    assert all_distance.shape[0] == len(dataset_obj)
+    assert all_index.shape[0] == len(dataset_obj)
+    return all_distance, all_index
+
+#----------------------------------------------------------------------------
+def calc_knn(image_path, ref_path, log_path, knn_save_path, num_expected, seed, batch):
+    """Calculate KNN for a given set of images."""
+    dist.print0(f'Loading dataset reference statistics from "{ref_path}"...')
+    # load reference images from zip file 
+    ref_images, _ = load_cifar10_zip(ref_path)
+    ref_images = torch.from_numpy(ref_images).to(torch.float32)
+
+    knn_distance, knn_index = calculate_knn_stats(image_path=image_path, ref_images=ref_images, num_expected=num_expected, seed=seed, max_batch_size=batch)
+    dist.print0('Calculating KNN distance...')
+    if dist.get_rank() == 0:
+        print(f'{knn_distance[:, 0].mean():g}')
+        # writting logs
+        with open(log_path, 'a') as f:
+            memorize_ratio = (knn_distance[:, 0] / knn_distance[:, 1]) < 1/3
+            msg = f'Loading images from "{image_path}". The calculated KNN distance is {knn_distance[:, 0].mean()}. The calibrated KNN ratio is {memorize_ratio.mean()}'
+            f.write(msg + "\n")
+        # save knn distribution
+        np.savez(knn_save_path, knn_distance=knn_distance, knn_index=knn_index)
+    torch.distributed.barrier()
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -212,30 +359,7 @@ def parse_int_list(s):
     return ranges
 
 #----------------------------------------------------------------------------
-
-@click.command()
-@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
-@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
-@click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
-@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
-@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
-
-@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
-@click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
-@click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
-@click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
-@click.option('--S_churn', 'S_churn',      help='Stochasticity strength', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
-@click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
-@click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
-
-@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
-@click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
-@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
-@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
-
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def generate(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -251,7 +375,6 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     torchrun --standalone --nproc_per_node=2 generate.py --outdir=out --seeds=0-999 --batch=64 \\
         --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
     """
-    dist.init()
     num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
     all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
     rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
@@ -309,6 +432,60 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     dist.print0('Done.')
 
 #----------------------------------------------------------------------------
+@click.command()
+@click.option('--expdir',                  help='Where to save all checkpoints', metavar='DIR',                     type=str, required=True)
+@click.option('--knn-ref', 'knn_ref_path', help='Dataset reference statistics for KNN', metavar='NPZ|URL',          type=str, required=True)
+@click.option('--log', 'log_path',         help='Path to save log', metavar='PATH',                                 type=str, required=True)
+@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
+@click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
+@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
+@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+
+@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
+@click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
+@click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
+@click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
+@click.option('--S_churn', 'S_churn',      help='Stochasticity strength', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
+@click.option('--S_min', 'S_min',          help='Stoch. min noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default=0, show_default=True)
+@click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
+@click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
+
+@click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
+@click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
+@click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
+@click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
+
+def main(expdir, knn_ref_path, log_path, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+    dist.init()
+    
+    network_pts = [os.path.join(expdir, pt) for pt in os.listdir(expdir) if pt.endswith('.pkl')]
+    network_pts.sort()
+    network_pts = network_pts[1:][::-1]         # reverse the order and don't need pkl 000000
+    dist.print0(network_pts)
+    outdir = os.path.join(expdir, 'fid-tmp')
+    num_expected = len(seeds)
+    dist.print0(f'Expected {num_expected} generated images!')
+    knn_dir = os.path.join(expdir, 'knn-dist')
+    os.makedirs(knn_dir, exist_ok=True)
+    for i in range(len(network_pts)):
+        network_pt = network_pts[i]
+        acc_imgs = os.path.basename(network_pt).split('.')[0].split('-')[-1]
+        network_pkl = os.path.join(expdir, 'network-snapshot-' + acc_imgs + '.pkl')
+        if dist.get_rank() == 0:
+            with open(log_path, 'a') as f:
+                msg = f'Generating images from "{network_pkl}".'
+                f.write(msg + "\n")
+        generate(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device, **sampler_kwargs)
+
+        # compute memorization
+        knn_save_path = os.path.join(knn_dir, os.path.basename(network_pkl).split('.')[0] + '.npz')
+        calc_knn(image_path=outdir, ref_path=knn_ref_path, log_path=log_path, knn_save_path=knn_save_path, num_expected=num_expected, seed=0, batch=max_batch_size)
+
+
+
+#----------------------------------------------------------------------------
+
+
 
 if __name__ == "__main__":
     main()
