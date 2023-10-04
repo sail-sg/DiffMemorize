@@ -36,8 +36,13 @@ We include the implementations of the theoretical optimum in `training/optim.py`
 torchrun --standalone --nproc_per_node=1 generate_optim.py --outdir=fid-tmp-optim --seeds=0-49999 --subdirs --network=datasets/cifar10/cifar10-train.zip
 ```
 
+We use following command to generate images by [EDM](https://github.com/NVlabs/edm):
+```
+torchrun --standalone --nproc_per_node=1 generate.py --outdir=fid-tmp-edm --seeds=0-49999 --subdirs --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl
+```
+
 ## Empirical Study
-The basic procedure to evaluate the contribution of factor on memorization in diffusion models is as follows:
+The basic procedure to evaluate the contribution of a factor on memorization in diffusion models is as follows:
 
 **Step I**: Sample a training dataset with different sizes $|\mathcal{D}|$. The codes are in `dataset_utils`, which will be introduced later. The sampled dataset will be saved to `$data_path`.
 
@@ -69,9 +74,11 @@ torchrun --standalone --nproc_per_node=$num_gpu mem_ratio.py --expdir=$outdir --
 `$outdir` refers to the folder including all model snapshots.
 
 
-**Step IV**: Modify the value of factor, and then repeat Step I-III and find the Effective Model Memorization (EMM).
+**Step IV**: Gradually increase the training dataset size $|\mathcal{D}|$, and then repeat Step I to Step III and find the Effective Model Memorization (EMM).
 
-We provide all the scripts to reproduce our experimental results in the paper in following subsections.
+**Step V**: Modify the value of the evaluated factor, and then repeat Step I to Step IV to observe the effect of this factor to memorization.
+
+We provide all the scripts to reproduce our experimental results in the paper.
 
 
 * Data distribution $P$: refer to `scripts/data_distribution.md`. Here we highlight that data dimension has significant contributions to memorization in diffusion models. 

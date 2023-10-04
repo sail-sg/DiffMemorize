@@ -298,7 +298,7 @@ def interpolate_cifar10_certain_class(tarball: str, *, max_images: Optional[int]
 
     max_idx = maybe_min(len(cifar10_images), max_images)
 
-    cifar10_num = int(max_idx * inter_rate)
+    cifar10_num = int(max_idx * (1-inter_rate))
     imagenet_num = max_idx - cifar10_num
     print(f"Number of Cifar10 samples: {cifar10_num} and number of ImageNet samples: {imagenet_num}")
     images = np.concatenate([cifar10_images[:cifar10_num], imagenet_images[:imagenet_num]], axis=0)

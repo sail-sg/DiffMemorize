@@ -12,7 +12,7 @@ Run the following command to train a diffusion model on $\mathcal{D}$ with diffe
 torchrun --standalone --nproc_per_node=8 train.py --outdir=$savedir --data=datasets/cifar10/data_dimension/cifar10-$resolution'x'$resolution'-'$size.zip --cond=0 --arch=ddpmpp --augment=0.0 --window-size=0.0 --precond=vp --seed=1024 --duration=2000 --num-blocks=2 --num-channels=128 --fp16=False --lr=2e-4 --attn-resolutions=$attn_resolutions
 ```
 
-Here `$attn_resolutions` refers to the location of attention mechanism in the model architecture. We take the following values to ensure the model architecture the same.
+Here `$attn_resolutions` refers to the location of attention mechanism in the model architecture. We take the following values to ensure the model architectures are the same.
 
 * When `$resolution=32`, `$attn_resolutions=16`.
 * When `$resolution=16`, `$attn_resolutions=8`.
