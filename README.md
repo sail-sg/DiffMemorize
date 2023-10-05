@@ -1,5 +1,5 @@
 # On Memorization in Diffusion Models
-Code for the paper [On Memorization in Diffusion Models]().
+Code for the paper [On Memorization in Diffusion Models](https://arxiv.org/abs/2310.02664).
 
 ## Environments
 
@@ -109,7 +109,15 @@ Finally, we highlight that conditional EDM with unique labels as conditions can 
 </p>
 
 ## References
-If you find the code useful for your research, please consider citing our paper
+If you find the code useful for your research, please consider citing our paper.
+```BibTex
+@article{gu2023memorization,
+      title={On Memorization in Diffusion Models}, 
+      author={Xiangming Gu and Chao Du and Tianyu Pang and Chongxuan Li and Min Lin and Ye Wang},
+      journal={arXiv preprint arXiv:2310.02664},
+      year={2023}
+}
+```
 
 
 ## Acknowledgements
